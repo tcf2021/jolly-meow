@@ -1,0 +1,25 @@
+[Unit]
+Description=Jolly Meow HTTPS egress on the overseas server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/tinyproxy -d -c /etc/jollymeow-google-relay/tinyproxy.conf
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=96M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

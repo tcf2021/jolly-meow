@@ -1,0 +1,1062 @@
+# This YAML file can be used as a CloudFormation Stack to spin up the
+# jolly-roger environment. This file is loaded directly into CloudFormation,
+# which means that some features of YAML (e.g. references) are unavailable.
+#
+# The jolly-roger environment consists of:
+#
+# - A VPC with a public subnet
+#
+# - A system for fetching secrets using AWS Systems Manager Parameter Store
+#   which encrypts secrets using KMS.
+#
+# - An auto-scaling group (ASG) with instances that automatically launch the
+#   jolly-roger application.
+#
+# - The application instances run several docker services:
+#
+#   - An haproxy instance for ports 80 and 443, separating STUN and HTTP
+#     traffic on port 443 (routing STUN to coturn, switching to HTTP mode
+#     for everything else), reverse proxying HTTP to the application, and
+#     redirecting port 80 to HTTPS
+#
+#   - A coturn server for TURN proxying if needed for audio conferencing
+#
+#   - The actual Meteor application
+#
+#   - Watchtower, which periodically pulls image updates
+#
+# - A Network Load Balancer (NLB) in front of the ASG, forwarding ports 80 and
+#   443 to ports 80 and 443 on application servers. NLB is responsible for
+#   terminating TLS, but otherwise forwards network traffic unmodified.
+#
+# It's possible this could be used to run multiple parallel copies of the
+# jolly-roger website, though that's not very likely in practice.
+#
+# To spin up an independent copy of jolly-roger, you'll _definitely_ need to do
+# the following (and probably more I've forgotten):
+#
+# - Set up a certificate in AWS Certificate Manager for the domain. The ARN will
+#   be configured as the CertificateArn paramater.
+#
+# - Provide the MongoDB URL. The free account from mongodb.com (for instance)
+#   should be sufficient. You can configure a user using the "AWS IAM"
+#   authentication method, the type "IAM Role", and the ARN
+#   "arn:aws:iam::<AWS Account ID>:role/JollyRogerAppInstanceRole"; then you can
+#   specify authMechanism=MONGODB-AWS in the URL and do not need to provide a
+#   username/password. You will need to configure the user with the "Atlas
+#   admin" built-in role, and to enable connections from 0.0.0.0/0 (all IPs)
+#   since the EC2 instance IPs aren't static.
+#
+#   You can either set the MongoUrl and MongoOplogUrl parameters here, or set
+#   them using `aws ssm put-parameter --type "SecureString" --name "mongo"
+#   --value "<path>"` and `aws ssm put-parameter --type "SecureString" --name
+#   "mongo.oplog" --value "<path>"` (e.g. if you're using regular username/
+#   password credentials as part of the URLs).
+#
+# - Signup for a Mailgun account (or any mail provider that supports SMTP
+#   submission), and add an SMTP URL with the SMTP credentials from your mailgun
+#   account. The URL format should be something like:
+#
+#     smtp://postmaster%40yourdomain.com:smtp-password@smtp.mailgun.org:587
+#
+#   Store that using `aws ssm put-parameter --type "SecureString" --name
+#   "mailgun" --value "<path>"`.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: jolly-roger
+
+Parameters:
+  CertificateArn:
+    Description: ARN of the certificate to use
+    Type: String
+  AppName:
+    Description: The user-facing name of the app
+    Type: String
+    Default: Jolly Roger
+  AppUrl:
+    Description: The domain name of application
+    Type: String
+    Default: future.deathandmayhem.com
+  AppDomain:
+    Description: The zone under which to create DNS records
+    Type: AWS::Route53::HostedZone::Id
+  AppInstanceType:
+    Description: Instance type to run for app server
+    Type: String
+    Default: t3a.micro
+  AppMinSize:
+    Description: Minimum number of instances for app server ASG
+    Type: Number
+    Default: 1
+  AppMaxSize:
+    Description: Maximum number of instances for app server ASG
+    Type: Number
+    Default: 2
+  AppDesiredCapacity:
+    Description: Desired number of instances for app server ASG
+    Type: Number
+    Default: 1
+  DockerPackage:
+    Description: Docker package containing the app to deploy
+    Type: String
+    Default: "ghcr.io/deathandmayhem/jolly-roger"
+  PapertrailHost:
+    Description: Log host for Papertrail
+    Type: String
+    Default: ""
+    NoEcho: true
+  TurnSecret:
+    Description: TURN REST API secret
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9]+$"
+    NoEcho: true
+  MongoUrl:
+    Description: MONGO_URL to use with Meteor. Can leave unset and use "mongo" key in SSM if using username/password authentication.
+    Type: String
+    Default: ""
+  MongoOplogUrl:
+    Description: MONGO_OPLOG_URL to use with Meteor. Can leave unset and use "mongo.oplog" key in SSM if using username/password authentication.
+    Type: String
+    Default: ""
+  CloudWatchMode:
+    Description: Mode to use with CloudWatch. "None" disables CloudWatch. "Minimal" only captures memory and swap metrics to keep costs down (note that total CPU is a built-in metric). "Detailed" also captures disk, network, and detailed CPU metrics.
+    Type: String
+    Default: "Detailed"
+    AllowedValues: ["Detailed", "Minimal", "None"]
+  SshUsers:
+    Description: Comma-separated list of SSH users, each of the form <username>=<ssh_import_id>
+    Type: String
+    Default: "evan=gh:ebroder,zarvox=gh:zarvox"
+  ServingMode:
+    Description: |
+      In "NLB" mode, bring up a load balancer and point the domain to it, allowing scaling to
+      multiple EC2 jobs. TLS termination is handled by the NLB using the certificate referenced
+      in CertificateArn. In "SingleInstance" mode, the domain is pointed directly at a single
+      EC2 instance. The TLS certificate will be automatically managed via Let's Encrypt - be sure
+      to accept their terms of service. In "None" mode, all serving is disabled. Use this to shut
+      down the app and save on costs while keeping persistent resources like the S3 bucket alive
+      and making it simpler to enable serving in the future.
+    Type: String
+    Default: "NLB"
+    AllowedValues: ["NLB", "SingleInstance", "None"]
+  CertNotificationEmail:
+    Description: Email to use for certificate abuse and renewal notifications when using Let's Encrypt via the SingleInstance serving mode. Leave blank to disable notifications.
+    Type: String
+    Default: ""
+  UseSpotInstances:
+    Description: >-
+      Use spot instances to reduce EC2 costs. Spot instances can be interrupted
+      with 2 minutes notice. Capacity rebalancing is enabled to proactively
+      replace instances at risk of interruption, minimizing downtime.
+      Recommended for SingleInstance serving mode where brief interruptions are
+      acceptable.
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+
+Conditions:
+  HavePapertrail: !Not [!Equals [!Ref PapertrailHost, ""]]
+  HaveCloudWatch: !Not [!Equals [!Ref CloudWatchMode, "None"]]
+  HaveCloudWatchDetailed: !Equals [!Ref CloudWatchMode, "Detailed"]
+  HaveServing: !Not [!Equals [!Ref ServingMode, "None"]]
+  HaveLoadBalancing: !Equals [!Ref ServingMode, "NLB"]
+  HaveSingleInstance: !Equals [!Ref ServingMode, "SingleInstance"]
+  UseSpot: !Equals [!Ref UseSpotInstances, "Yes"]
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstanceTypes
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: "arn:aws:ssm:*:*:parameter/aws/service/canonical/*"
+
+  SshUsersParsingFunction:
+    Type: AWS::Lambda::Function
+    Condition: HaveServing
+    Properties:
+      Description: Generate the SSH users docker config from the raw input parameter
+      Runtime: nodejs22.x
+      Handler: "index.main"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const response = require('cfn-response');
+
+          exports.main = function (event, context) {
+            const sshUsers = event.ResourceProperties.SshUsers.split(',');
+            var output = 'users:\n'
+            sshUsers.forEach((sshUser) => {
+                const parts = sshUser.split('=');
+                output += `  - name: ${parts[0]}\n`
+                output += `    shell: /bin/bash\n`
+                output += `    ssh_import_id: ${parts[1]}\n`
+                output += `    sudo: ALL=(ALL) NOPASSWD:ALL\n`
+            });
+            response.send(event, context, response.SUCCESS, { Output: output });
+          };
+  SshUsersParsing:
+    Type: Custom::SshUsersParsing
+    Condition: HaveServing
+    Properties:
+      ServiceToken: !GetAtt SshUsersParsingFunction.Arn
+      SshUsers: !Ref SshUsers
+
+  ArchitectureLookupFunction:
+    Type: AWS::Lambda::Function
+    Condition: HaveServing
+    Properties:
+      Description: Look up CPU architecture and AMI ID for the given instance type
+      Runtime: nodejs22.x
+      Handler: "index.main"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const { EC2Client, DescribeInstanceTypesCommand } = require('@aws-sdk/client-ec2');
+          const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
+          const https = require('https');
+
+          function sendResponse(event, context, status, data) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: 'See CloudWatch Log Stream: ' + context.logStreamName,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: data,
+            });
+            const url = new URL(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: url.hostname,
+                port: 443,
+                path: url.pathname + url.search,
+                method: 'PUT',
+                headers: { 'Content-Type': '', 'Content-Length': body.length },
+              }, resolve);
+              req.on('error', reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.main = async function (event, context) {
+            if (event.RequestType === 'Delete') {
+              return sendResponse(event, context, 'SUCCESS', {});
+            }
+            try {
+              const region = event.ResourceProperties.Region;
+              const ec2 = new EC2Client({ region });
+              const result = await ec2.send(new DescribeInstanceTypesCommand({
+                InstanceTypes: [event.ResourceProperties.InstanceType],
+              }));
+              const arch = result.InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0];
+              // EC2 returns "x86_64" or "arm64"; Ubuntu/Docker use "amd64" or "arm64"
+              const normalized = arch === 'x86_64' ? 'amd64' : arch;
+
+              const ssmPath = `/aws/service/canonical/ubuntu/server/22.04/stable/current/${normalized}/hvm/ebs-gp2/ami-id`;
+              const ssm = new SSMClient({ region });
+              const param = await ssm.send(new GetParameterCommand({ Name: ssmPath }));
+              const amiId = param.Parameter.Value;
+
+              await sendResponse(event, context, 'SUCCESS', { Architecture: normalized, AmiId: amiId });
+            } catch (err) {
+              console.log(err);
+              await sendResponse(event, context, 'FAILED', { Error: err.message });
+            }
+          };
+
+  ArchitectureLookup:
+    Type: Custom::ArchitectureLookup
+    Condition: HaveServing
+    Properties:
+      ServiceToken: !GetAtt ArchitectureLookupFunction.Arn
+      Region: !Ref "AWS::Region"
+      InstanceType: !Ref AppInstanceType
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: HaveServing
+    Properties:
+      CidrBlock: 10.32.0.0/16
+      EnableDnsHostnames: true
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: HaveServing
+    Properties:
+      VpcId: !Ref VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: HaveServing
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: HaveServing
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteToInternet:
+    Type: AWS::EC2::Route
+    Condition: HaveServing
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicSubnetRouteTable
+    DependsOn: InternetGatewayAttachment
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: HaveServing
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.32.0.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: HaveServing
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: HaveServing
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.32.1.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: HaveServing
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  ImageUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+  ImageUploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageUploadBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: ["s3:GetObject"]
+            Resource: !Sub "arn:aws:s3:::${ImageUploadBucket}/*"
+
+  CertificateStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "JollyRogerAppInstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ssm-download
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeParameters
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - PolicyName: s3-uploads
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub "arn:aws:s3:::${ImageUploadBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${ImageUploadBucket}/*"
+        - PolicyName: s3-cert-cache
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${CertificateStorageBucket}/*"
+        - PolicyName: eip-association
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AssociateAddress
+                Resource: "*"
+        - PolicyName: dns-updates
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZones
+                  - route53:GetChange
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource: !Sub "arn:aws:route53:::hostedzone/${AppDomain}"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AppInstanceRole
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HaveServing
+    Properties:
+      GroupDescription: Security group for app server instances
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+        - Description: Mediasoup RTC ports
+          CidrIp: 0.0.0.0/0
+          IpProtocol: udp
+          FromPort: 50000
+          ToPort: 65535
+        - Description: Mediasoup RTC ports
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 50000
+          ToPort: 65535
+        - Description: TURN relay ports
+          CidrIp: 0.0.0.0/0
+          IpProtocol: udp
+          FromPort: 40000
+          ToPort: 49999
+        - Description: ICMP echo request
+          CidrIp: 0.0.0.0/0
+          IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+        - Description: ICMP echo reply
+          CidrIp: 0.0.0.0/0
+          IpProtocol: icmp
+          FromPort: 0
+          ToPort: -1
+        - Description: ICMP frag needed
+          CidrIp: 0.0.0.0/0
+          IpProtocol: icmp
+          FromPort: 3
+          ToPort: 4
+      VpcId: { Ref: VPC }
+
+  AppNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: HaveLoadBalancing
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+  AppNlbTargetHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HaveLoadBalancing
+    Properties:
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 443
+      HealthCheckPath: /healthcheck
+      HealthCheckIntervalSeconds: 5
+      HealthCheckTimeoutSeconds: 4
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Protocol: TCP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: true
+  AppNlbTargetHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HaveLoadBalancing
+    Properties:
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 443
+      HealthCheckPath: /healthcheck
+      HealthCheckIntervalSeconds: 5
+      HealthCheckTimeoutSeconds: 4
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Protocol: TCP
+      Port: 443
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: true
+  AppNlbListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HaveLoadBalancing
+    Properties:
+      LoadBalancerArn: !Ref AppNlb
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppNlbTargetHTTP
+  AppNlbListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HaveLoadBalancing
+    Properties:
+      LoadBalancerArn: !Ref AppNlb
+      Protocol: TLS
+      Port: 443
+      Certificates:
+        - { CertificateArn: !Ref CertificateArn }
+      AlpnPolicy: [HTTP2Preferred]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppNlbTargetHTTPS
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HaveServing
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt AppInstanceProfile.Arn
+        ImageId: !GetAtt ArchitectureLookup.AmiId
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 12
+          - DeviceName: /dev/sdb
+            VirtualName: ephemeral0
+          - DeviceName: /dev/sdc
+            VirtualName: ephemeral1
+        InstanceType: !Ref AppInstanceType
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        # We're generating a YAML file inside a YAML file. Yes, this is
+        # gross, but it seems to be the best anyone has come up with
+        # (especially since we need variable interpolation)
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #cloud-config
+
+              package_upgrade: true
+
+              apt:
+                sources:
+                  docker.list:
+                    source: "deb [arch=${ArchitectureLookup.Architecture}] https://download.docker.com/linux/ubuntu $RELEASE stable"
+                    keyid: "8D81803C0EBFCD88"
+
+              ${SshUsersConfig}
+
+              swap:
+                filename: "/swapfile"
+                size: 2147483648 # 2GB
+
+              packages:
+                - awscli
+                - docker-ce
+                - docker-ce-cli
+                - containerd.io
+                - htop
+                - moreutils
+                - python3-dev
+                - python3-pip
+                - certbot
+                - python3-certbot-dns-route53
+                - socat
+
+              ${PapertrailRsyslogConfig}
+
+              write_files:
+                - path: /etc/cron.hourly/docker-cleanup
+                  content: |
+                    #!/bin/sh
+                    docker volume ls -qf dangling=true | chronic xargs -r docker volume rm
+                  permissions: "0755"
+                - path: /etc/docker/daemon.json
+                  content: |
+                    {
+                      "log-driver": "json-file",
+                      "log-opts": {
+                        "max-size": "100m"
+                      }
+                    }
+                - path: /usr/local/bin/renew-certificate
+                  content: |
+                    #!/bin/bash
+                    set -e
+
+                    CERT_BUCKET="${CertBucket}"
+                    CERT_PEM="/etc/haproxy/certs/cert.pem"
+
+                    mkdir -p /etc/haproxy/certs
+
+                    need_certbot=true
+
+                    # Skip everything if local cert exists and isn't expiring soon
+                    if [ -f "$CERT_PEM" ] && \
+                       openssl x509 -in "$CERT_PEM" -checkend 2592000 -noout 2>/dev/null; then
+                      need_certbot=false
+                    # Fall back to S3 cache (e.g. fresh instance launch)
+                    elif aws s3 cp "s3://$CERT_BUCKET/cert.pem" "$CERT_PEM" 2>/dev/null && \
+                         openssl x509 -in "$CERT_PEM" -checkend 2592000 -noout 2>/dev/null; then
+                      need_certbot=false
+                    fi
+
+                    if $need_certbot; then
+                      if [ -n "${CertNotificationEmail}" ]; then
+                        email_flag="-m ${CertNotificationEmail}"
+                      else
+                        email_flag="--register-unsafely-without-email"
+                      fi
+                      certbot -v certonly --dns-route53 -d ${AppUrl} --non-interactive --agree-tos $email_flag
+                      cat /etc/letsencrypt/live/${AppUrl}/fullchain.pem /etc/letsencrypt/live/${AppUrl}/privkey.pem > "$CERT_PEM"
+                      # Persist to S3 for future instance launches
+                      aws s3 cp "$CERT_PEM" "s3://$CERT_BUCKET/cert.pem"
+                    fi
+
+                    # If haproxy is running, perform a live certificate update.
+                    if [ -S /var/run/haproxy/stats.sock ]; then
+                      echo -e "set ssl cert /usr/local/etc/haproxy/certs/cert.pem <<\n$(cat $CERT_PEM)\n" | socat stdio /var/run/haproxy/stats.sock
+                      echo -e "commit ssl cert /usr/local/etc/haproxy/certs/cert.pem" | socat stdio /var/run/haproxy/stats.sock
+                    fi
+                  permissions: "0755"
+                - path: /etc/haproxy/errors/503.http
+                  content: |
+                    HTTP/1.1 503 Service Unavailable
+                    Content-Type: text/html; charset=utf-8
+                    Cache-Control: no-cache
+                    Connection: close
+
+                    <!DOCTYPE html>
+                    <html lang="en">
+                      <head>
+                        <meta charset="utf-8">
+                        <title>${AppName} :: Temporarily Down</title>
+                        <style type="text/css">
+                          /* Standard font */
+                          @import url("https://fonts.googleapis.com/css2?family=Source+Sans+Pro:ital,wght@0,400;0,700;1,400;1,700&display=swap");
+
+                          body {
+                            font-family: "Platform Emoji", "Source Sans Pro", "Helvetica Neue", "Helvetica", "Arial", sans-serif, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji";
+                            font-size: 16px;
+                            line-height: 1.5;
+                            max-width: 800px;
+                            margin: 0 auto;
+                            padding: 1em;
+                          }
+                          h1 {
+                            font-size: 2.5em;
+                            font-weight: 500;
+                            margin: 0;
+                          }
+                          p {
+                            margin-top: 0;
+                          }
+                          .warning {
+                            color: #842029;
+                            background-color: #f8d7da;
+                            border: 1px solid #f5c2c7;
+                            margin: 1em 0;
+                            padding: 0.75em 1.25em;
+                            border-radius: 0.375rem;
+                          }
+                          .warning p {
+                            margin: 0;
+                          }
+                          .hidden {
+                            display: none;
+                          }
+                          @keyframes spinner {
+                            to {transform: rotate(360deg);}
+                          }
+                          .spinner:before {
+                            content: '';
+                            box-sizing: border-box;
+                            position: relative;
+                            display: inline-block;
+                            top: 50%;
+                            left: 50%;
+                            width: 20px;
+                            height: 20px;
+                            margin-top: -10px;
+                            margin-left: -10px;
+                            border-radius: 50%;
+                            border: 2px solid #ccc;
+                            border-top-color: #000;
+                            animation: spinner .6s linear infinite;
+                          }
+                        </style>
+                      </head>
+                      <body>
+                        <h1>Temporarily Down</h1>
+
+                        <div class="warning hidden">
+                          <p>
+                            <strong>Warning:</strong> The ${AppName} server is taking longer than expected to come back up.
+                            Please contact the ${AppName} team if this problem persists.
+                          </p>
+                        </div>
+
+                        <p>
+                          The ${AppName} server is temporarily down. Usually this happens when a new
+                          version is being deployed. This page will automatically refresh once the site
+                          is back up.
+                        </p>
+
+                        <p>
+                          <span class="spinner"></span>
+                        </p>
+                        <script>
+                          // Attempt to refresh every 5 seconds. After 1 minute, display a warning that
+                          // it's taking longer than expected.
+                          const deadline = Date.now() + 60 * 1000;
+                          let timeout = null;
+                          const tick = async () => {
+                            if (Date.now() > deadline) {
+                              document.querySelector(".warning").classList.remove("hidden");
+                            }
+
+                            try {
+                              const response = await fetch(window.location.href, { method: "HEAD" })
+                              if (response.ok) {
+                                clearTimeout(timeout);
+                                window.location.reload();
+                              }
+                            } catch (e) {
+                              console.log(e);
+                            }
+
+                            timeout = setTimeout(tick, 4500 + Math.random() * 1000);
+                          };
+                          tick();
+                        </script>
+                      </body>
+                    </html>
+                - path: /etc/haproxy/haproxy.cfg
+                  content: |
+                    global
+                      # Enable runtime API for live certificate updates
+                      stats socket /var/run/haproxy/stats.sock mode 600 level admin
+                      maxconn 50000
+                      log stdout local0
+
+                    defaults
+                      log global
+                      option logasap
+                      timeout connect 5s
+                      timeout client 50s
+                      timeout server 50s
+
+                    frontend inbound
+                      bind :443 ${SingleInstanceCertReference}
+                      mode tcp
+                      tcp-request inspect-delay 5s
+                      # don't pick backend until we've seen enough to identify
+                      # both STUN and HTTP/2 (STUN headers are only 20 bytes, so
+                      # we can't check the full standard HTTP/2 prefix)
+                      acl seen_headers req.len gt 20
+                      tcp-request content accept if seen_headers
+                      # In STUN, the first two bits are always 0 (to convert to
+                      # an int, we need to go through a hex string)
+                      acl is_turn_prefix req.payload(0,1),hex,hex2i,and(196),not
+                      # ...and the 4th-7th byte have the magic cookie
+                      acl is_turn_magic_cookie req.payload(4,4) -m bin 2112a442
+                      # Switch non-STUN traffic to HTTP mode
+                      tcp-request content switch-mode http unless is_turn_prefix is_turn_magic_cookie
+
+                      # --- HTTP mode from here ---
+                      option forwardfor
+                      http-request del-header Proxy
+                      http-response set-header Strict-Transport-Security "max-age=31536000"
+                      compression algo gzip
+                      compression type text/plain text/css application/javascript application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript
+                      # Health check endpoint handled directly
+                      acl is_healthcheck path /healthcheck
+                      http-request return status 200 content-type text/plain string "OK\n" if is_healthcheck
+
+                      use_backend turn if is_turn_prefix is_turn_magic_cookie
+                      default_backend app
+
+                    frontend http-redirect
+                      bind :80
+                      mode http
+                      http-request redirect scheme https code 301
+
+                    backend turn
+                      mode tcp
+                      server turn localhost:3478
+
+                    backend app
+                      mode http
+                      server app 127.0.0.1:3000
+                      errorfile 503 /usr/local/etc/haproxy/errors/503.http
+                - path: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+                  content: |
+                    {
+                      "metrics": {
+                        "append_dimensions": {
+                          "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                          "ImageId": "${!aws:ImageId}",
+                          "InstanceId": "${!aws:InstanceId}",
+                          "InstanceType": "${!aws:InstanceType}"
+                        },
+                        "metrics_collected": {
+                          ${CloudWatchMetrics}
+                        }
+                      }
+                    }
+
+              runcmd:
+                - set -eux
+
+                # Whatever happens, let cloudformation know
+                - pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                - cleanup() { ret=$?; set +e; cfn-signal -e $ret -r "runcmds complete" --stack=${AWS::StackName} --region=${AWS::Region} --resource=AppAsg; exit $ret; }
+                - trap cleanup EXIT
+
+                # Uninstall Amazon SSM manager and snapd - we don't use them, and they eat memory (and cause swap-thrashing)
+                - snap remove amazon-ssm-agent
+                - sudo apt-get remove -y snapd
+
+                # Disable certbot's built-in scheduled task - we use our own so we can also refresh haproxy.
+                - sudo systemctl stop certbot.timer
+                - sudo systemctl disable certbot.timer
+
+                - export AWS_DEFAULT_REGION=${AWS::Region}
+
+                ${CloudWatchAgentConfig}
+                ${PapertrailDockerConfig}
+                ${SingleInstanceCertConfig}
+
+                - docker run --name coturn -d --restart=unless-stopped --network=host -e DETECT_EXTERNAL_IP=yes coturn/coturn -v --min-port=40000 --max-port=49999 --log-file=stdout --realm=${AppUrl} --use-auth-secret --static-auth-secret=${TurnSecret}
+                - docker run --name jolly-roger -d --network=host --restart=unless-stopped -e AWS_REGION=$AWS_DEFAULT_REGION -e AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION -e PORT=3000 -e ROOT_URL=https://${AppUrl} -e TURN_SERVER=turns:${AppUrl}:443?transport=tcp -e TURN_SECRET=${TurnSecret} -e MONGO_URL="${MongoUrl}" -e MONGO_OPLOG_URL="${MongoOplogUrl}" ${DockerPackage}
+                - docker run --name watchtower -d --restart=unless-stopped -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --interval 30 --cleanup
+                - docker run --name haproxy -d --restart=unless-stopped --user root --network=host -v /var/run/haproxy:/var/run/haproxy -v /etc/haproxy:/usr/local/etc/haproxy:ro haproxy
+
+                ${SingleInstanceEipAssociation}
+            - PapertrailRsyslogConfig: !If
+                - HavePapertrail
+                - !Sub |
+                  rsyslog:
+                    remotes:
+                      papertrail: ${PapertrailHost}
+                - ""
+              PapertrailDockerConfig: !If
+                - HavePapertrail
+                - !Sub '- docker run --name logspout -d --restart=unless-stopped -v /var/run/docker.sock:/tmp/docker.sock -e "SYSLOG_HOSTNAME=$(hostname){{.Container.Name}}" gliderlabs/logspout:master syslog://${PapertrailHost}'
+                - ""
+              CloudWatchAgentConfig: !If
+                - HaveCloudWatch
+                - !Sub |2
+                  # Observability
+                    - curl -O https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/${ArchitectureLookup.Architecture}/latest/amazon-cloudwatch-agent.deb
+                    - dpkg -i ./amazon-cloudwatch-agent.deb
+                    - rm amazon-cloudwatch-agent.deb
+                    - sudo systemctl start amazon-cloudwatch-agent
+                - ""
+              CloudWatchMetrics: !If
+                - HaveCloudWatchDetailed
+                - '"mem": {
+                  "measurement": ["mem_used_percent"]
+                  },
+                  "swap": {
+                  "measurement": ["swap_used_percent"]
+                  },
+                  "cpu": {
+                  "measurement": [
+                  "cpu_usage_idle",
+                  "cpu_usage_iowait",
+                  "cpu_usage_user",
+                  "cpu_usage_system"
+                  ]
+                  },
+                  "diskio": {
+                  "measurement": [
+                  "io_time",
+                  "write_bytes",
+                  "read_bytes",
+                  "writes",
+                  "reads"
+                  ]
+                  },
+                  "netstat": {
+                  "measurement": [
+                  "tcp_established",
+                  "tcp_time_wait"
+                  ]
+                  }'
+                - '"mem": {
+                  "measurement": ["mem_used_percent"]
+                  },
+                  "swap": {
+                  "measurement": ["swap_used_percent"]
+                  }'
+              CertBucket: !Ref CertificateStorageBucket
+              SshUsersConfig: !GetAtt SshUsersParsing.Output
+              SingleInstanceCertConfig: !If
+                - HaveLoadBalancing
+                - ""
+                - "- sudo ln -s /usr/local/bin/renew-certificate /etc/cron.daily/ && /usr/local/bin/renew-certificate"
+              SingleInstanceCertReference: !If
+                - HaveLoadBalancing
+                - ""
+                - ssl crt /usr/local/etc/haproxy/certs/ alpn h2,http/1.1
+              SingleInstanceEipAssociation: !If
+                - HaveLoadBalancing
+                - ""
+                - !Sub
+                  - |2
+                    # Associate the Elastic IP once the app is healthy
+                      - until curl -sf http://localhost:3000/ > /dev/null; do sleep 5; done
+                      - aws ec2 associate-address --allocation-id ${AllocationId} --instance-id $(cloud-init query instance_id)
+                  - AllocationId: !GetAtt AppInstancePublicIp.AllocationId
+
+  AppInstancePublicIp:
+    Type: AWS::EC2::EIP
+    Condition: HaveSingleInstance
+    Properties:
+      Domain: "vpc"
+    DependsOn:
+      - InternetGatewayAttachment
+
+  AppAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HaveServing
+    Properties:
+      AutoScalingGroupName: "JollyRogerAsg"
+      HealthCheckType: !If
+        - HaveLoadBalancing
+        - ELB
+        - EC2
+      HealthCheckGracePeriod: 1800
+      CapacityRebalance: !If [UseSpot, true, false]
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: !If [UseSpot, 0, !Ref AppDesiredCapacity]
+          OnDemandPercentageAboveBaseCapacity: !If [UseSpot, 0, 100]
+          SpotAllocationStrategy: price-capacity-optimized
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref AppLaunchTemplate
+            Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      MaxSize: !Ref AppMaxSize
+      MinSize: !Ref AppMinSize
+      DesiredCapacity: !Ref AppDesiredCapacity
+      TargetGroupARNs: !If
+        - HaveLoadBalancing
+        - [!Ref AppNlbTargetHTTP, !Ref AppNlbTargetHTTPS]
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: DNSZone
+          Value: !Ref AppDomain
+          PropagateAtLaunch: false
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WaitOnResourceSignals: true
+        PauseTime: PT30M
+        MinSuccessfulInstancesPercent: 100
+        MinInstancesInService: 1
+
+  AppDns:
+    Type: AWS::Route53::RecordSet
+    Condition: HaveServing
+    Properties:
+      HostedZoneId: !Ref AppDomain
+      Name: !Ref AppUrl
+      Type: A
+      AliasTarget: !If
+        - HaveLoadBalancing
+        - HostedZoneId: !GetAtt AppNlb.CanonicalHostedZoneID
+          DNSName: !GetAtt AppNlb.DNSName
+        - !Ref "AWS::NoValue"
+      ResourceRecords: !If
+        - HaveLoadBalancing
+        - !Ref "AWS::NoValue"
+        - [!Ref AppInstancePublicIp]
+      TTL: !If
+        - HaveLoadBalancing
+        - !Ref "AWS::NoValue"
+        - 300

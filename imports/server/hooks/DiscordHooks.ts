@@ -1,0 +1,317 @@
+import { Meteor } from "meteor/meteor";
+import i18n, { t } from "i18next";
+import Flags from "../../Flags";
+import Announcements from "../../lib/models/Announcements";
+import type { ChatMessageContentType } from "../../lib/models/ChatMessages";
+import ChatMessages from "../../lib/models/ChatMessages";
+import Dingwords from "../../lib/models/Dingwords";
+import Hunts from "../../lib/models/Hunts";
+import MeteorUsers from "../../lib/models/MeteorUsers";
+import type { PuzzleType } from "../../lib/models/Puzzles";
+import Puzzles from "../../lib/models/Puzzles";
+import Settings from "../../lib/models/Settings";
+import Tags from "../../lib/models/Tags";
+import nodeIsDingword from "../../lib/nodeIsDingword";
+import nodeIsImage from "../../lib/nodeIsImage";
+import nodeIsRoleMention from "../../lib/nodeIsRoleMention";
+import nodeIsText from "../../lib/nodeIsText";
+import { computeSolvedness } from "../../lib/solvedness";
+import { DiscordBot } from "../discord";
+import { serverLanguage } from "../lang";
+import type Hookset from "./Hookset";
+
+async function makeDiscordBotFromSettings(): Promise<DiscordBot | undefined> {
+  // Above all else, obey the circuit breaker
+  if (await Flags.activeAsync("disable.discord")) {
+    return undefined;
+  }
+
+  const botSettings = await Settings.findOneAsync({ name: "discord.bot" });
+  if (botSettings?.name !== "discord.bot") {
+    return undefined;
+  }
+
+  const token = botSettings.value?.token;
+  if (!token) {
+    return undefined;
+  }
+
+  return new DiscordBot(token);
+}
+
+type DescriptionContent = { description: string };
+type ImageContent = { image: { url: string } };
+type Content = DescriptionContent | ImageContent;
+async function renderChatMessageContent(
+  content: ChatMessageContentType,
+): Promise<Content> {
+  if (content.children.length === 1 && nodeIsImage(content.children[0]!)) {
+    return { image: { url: content.children[0].url } };
+  }
+
+  const chunks = await Promise.all(
+    content.children.map(async (child) => {
+      if (nodeIsImage(child)) {
+        return ` ${child.url} `;
+      }
+      if (nodeIsText(child)) {
+        return child.text;
+      }
+      if (nodeIsRoleMention(child)) {
+        return ` @${child.roleId} `;
+      }
+      if (nodeIsDingword(child)) {
+        const dingword = await Dingwords.findOneAsync(child.dingwordId);
+        return ` #${dingword?.name ?? child.dingwordId}`;
+      }
+      const user = await MeteorUsers.findOneAsync(child.userId);
+      return ` @${user?.displayName ?? child.userId} `;
+    }),
+  );
+
+  return { description: chunks.join("") };
+}
+
+const DiscordHooks: Hookset = {
+  name: "DiscordHooks",
+
+  async onAnnouncement(announcementId: string) {
+    const bot = await makeDiscordBotFromSettings();
+    if (!bot) {
+      return;
+    }
+
+    const setting = await Settings.findOneAsync({ name: "discord.guild" });
+    const guildId = setting?.value.guild.id;
+    if (!guildId) {
+      return;
+    }
+
+    const announcement = (await Announcements.findOneAsync(announcementId))!;
+    const hunt = (await Hunts.findOneAsync(announcement.hunt))!;
+    const roleMap = await bot.fetchRoleMap(guildId);
+
+    // replace roles with role IDs
+    const message = announcement.message.replaceAll(/@(\w+)/g, (match, name) =>
+      roleMap[name] ? `<@&${roleMap[name]}>` : match,
+    );
+
+    const messageObj = {
+      content: message,
+      allowed_mentions: {
+        parse: ["roles", "everyone"],
+      },
+    };
+    if (hunt.announcementDiscordChannel) {
+      await bot.postMessageToChannel(
+        hunt.announcementDiscordChannel.id,
+        messageObj,
+      );
+    }
+  },
+
+  async onPuzzleCreated(puzzleId: string) {
+    const bot = await makeDiscordBotFromSettings();
+    if (!bot) {
+      return;
+    }
+
+    const puzzle = (await Puzzles.findOneAsync(puzzleId))!;
+    const hunt = (await Hunts.findOneAsync(puzzle.hunt))!;
+    if (hunt.puzzleHooksDiscordChannel) {
+      const title = i18n.t("discord.hooks.unlocked", "{{puzzle}} unlocked", {
+        lng: serverLanguage,
+        puzzle: puzzle.title,
+      });
+
+      const url = Meteor.absoluteUrl(
+        `hunts/${puzzle.hunt}/puzzles/${puzzle._id}`,
+      );
+      const tagNameList = await Tags.find({
+        _id: { $in: puzzle.tags },
+      }).mapAsync((t) => t.name);
+      const tags = tagNameList.map((tagName) => `\`${tagName}\``).join(", ");
+      const fields =
+        tags.length > 0
+          ? [
+              {
+                name: i18n.t("tags.tags", "Tags", { lng: serverLanguage }),
+                value: tags,
+                inline: true,
+              },
+            ]
+          : undefined;
+      const messageObj = {
+        embed: {
+          title,
+          url,
+          fields,
+        },
+      };
+      await bot.postMessageToChannel(
+        hunt.puzzleHooksDiscordChannel.id,
+        messageObj,
+      );
+    }
+  },
+
+  async onPuzzleUpdated(puzzleId: string, oldPuzzle: PuzzleType) {
+    const bot = await makeDiscordBotFromSettings();
+    if (!bot) {
+      return;
+    }
+
+    const puzzle = (await Puzzles.findOneAsync(puzzleId))!;
+    if (puzzle.title === oldPuzzle.title) {
+      return;
+    }
+
+    const hunt = (await Hunts.findOneAsync(puzzle.hunt))!;
+    if (hunt.puzzleHooksDiscordChannel) {
+      const title = i18n.t(
+        "discord.hooks.renamed",
+        "{{oldTitle}} renamed to {{newTitle}}",
+        {
+          lng: serverLanguage,
+          oldTitle: oldPuzzle.title,
+          newTitle: puzzle.title,
+        },
+      );
+
+      const url = Meteor.absoluteUrl(
+        `hunts/${puzzle.hunt}/puzzles/${puzzle._id}`,
+      );
+      const tagNameList = await Tags.find({
+        _id: { $in: puzzle.tags },
+      }).mapAsync((t) => t.name);
+      const tags = tagNameList.map((tagName) => `\`${tagName}\``).join(", ");
+      const fields =
+        tags.length > 0
+          ? [
+              {
+                name: t("tags.tags", "Tags", { lng: serverLanguage }),
+                value: tags,
+                inline: true,
+              },
+            ]
+          : undefined;
+      const messageObj = {
+        embed: {
+          title,
+          url,
+          fields,
+        },
+      };
+      await bot.postMessageToChannel(
+        hunt.puzzleHooksDiscordChannel.id,
+        messageObj,
+      );
+    }
+  },
+
+  async onPuzzleSolved(puzzleId: string) {
+    const bot = await makeDiscordBotFromSettings();
+    if (!bot) {
+      return;
+    }
+
+    const puzzle = (await Puzzles.findOneAsync(puzzleId))!;
+    const hunt = (await Hunts.findOneAsync(puzzle.hunt))!;
+    if (hunt.puzzleHooksDiscordChannel) {
+      const url = Meteor.absoluteUrl(
+        `hunts/${puzzle.hunt}/puzzles/${puzzle._id}`,
+      );
+      const answers = puzzle.answers
+        .map((answer) => `\`${answer}\``)
+        .join(", ");
+      const answerLabel = i18n.t("puzzle.answerOrGuess.Answer", {
+        lng: serverLanguage,
+        count: puzzle.expectedAnswerCount,
+      });
+
+      const solvedness = computeSolvedness(puzzle);
+      const color = {
+        solved: 0x00ff00,
+        unsolved: 0xffff00,
+        noAnswers: 0,
+      }[solvedness];
+      const solvedStr = {
+        solved: i18n.t("discord.hooks.solved", "solved", {
+          lng: serverLanguage,
+        }),
+        unsolved: i18n.t("discord.hooks.partiallySolved", "partially solved", {
+          lng: serverLanguage,
+        }),
+        noAnswers: "",
+      }[solvedness];
+      const title = `${puzzle.title} ${solvedStr}`;
+      const messageObj = {
+        embed: {
+          color,
+          title,
+          url,
+          fields: [{ name: answerLabel, value: answers, inline: true }],
+        },
+      };
+      await bot.postMessageToChannel(
+        hunt.puzzleHooksDiscordChannel.id,
+        messageObj,
+      );
+    }
+  },
+
+  async onChatMessageCreated(chatMessageId: string) {
+    const bot = await makeDiscordBotFromSettings();
+    if (!bot) {
+      return;
+    }
+
+    const chatMessage = (await ChatMessages.findOneAsync(chatMessageId))!;
+    const puzzle = (await Puzzles.findOneAsync(chatMessage.puzzle))!;
+    const hunt = (await Hunts.findOneAsync(chatMessage.hunt))!;
+    if (hunt.firehoseDiscordChannel) {
+      const channel = hunt.firehoseDiscordChannel.id;
+
+      let name: string;
+      if (!chatMessage.sender) {
+        name = "Jolly Roger";
+      } else {
+        name = chatMessage.sender;
+        const user = await MeteorUsers.findOneAsync(chatMessage.sender);
+        if (user?.discordAccount) {
+          name = user.discordAccount.username;
+        } else if (user?.displayName) {
+          name = user.displayName;
+        }
+      }
+
+      const url = Meteor.absoluteUrl(
+        `hunts/${chatMessage.hunt}/puzzles/${chatMessage.puzzle}`,
+      );
+      let title = puzzle.title;
+      if (title.length > 25) {
+        title = `${title.slice(0, 24)}…`;
+      }
+
+      const description = await renderChatMessageContent(chatMessage.content);
+      const msg = {
+        embed: {
+          author: {
+            name,
+          },
+          url,
+          title,
+          ...description,
+        },
+        nonce: chatMessageId,
+        allowed_mentions: {
+          parse: [],
+        },
+      };
+
+      void bot.postMessageToChannel(channel, msg);
+    }
+  },
+};
+
+export default DiscordHooks;

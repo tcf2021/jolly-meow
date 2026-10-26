@@ -1,0 +1,57 @@
+@use "sass:color";
+
+// Standard font
+@import url("https://fonts.googleapis.com/css2?family=Source+Sans+Pro:ital,wght@0,400;0,700;1,400;1,700&display=swap");
+
+// Answer monospace font
+@import url("https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@400&display=swap");
+
+$primary: #4d6e59;
+$info: #e0c5b4;
+$danger: #c94a4a;
+$success: #5cb338;
+
+@import "_theme";
+@import "../../node_modules/bootstrap/scss/bootstrap";
+
+.btn-primary {
+  --bs-btn-color: #fff;
+  --bs-btn-hover-color: #fff;
+  --bs-btn-active-color: #fff;
+  --bs-btn-disabled-color: #fff;
+}
+
+.btn-outline-primary {
+  --bs-btn-active-color: #fff;
+}
+
+.text-bg-primary {
+  color: #fff !important;
+}
+
+.form-control {
+  border-color: #d9d9d9;
+
+  &:focus {
+    border-color: #4096ff;
+    box-shadow: 0 0 0 2px #1677ff18;
+  }
+}
+
+.btn-secondary {
+  --bs-btn-color: var(--bs-body-color);
+  --bs-btn-bg: var(--bs-body-bg);
+  --bs-btn-border-color: var(--bs-border-color);
+  --bs-btn-hover-color: #1677ff;
+  --bs-btn-hover-bg: #e6f4ff;
+  --bs-btn-hover-border-color: #91caff;
+}
+
+// Give outline buttons distinct hover and active styles
+$btn-outline-hover-tint: 80%;
+@each $color, $value in $theme-colors {
+  .btn-outline-#{$color}:hover {
+    background-color: color.mix(white, $value, $btn-outline-hover-tint);
+    color: $value;
+  }
+}

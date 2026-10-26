@@ -1,0 +1,43 @@
+{
+  "compilerOptions": {
+    /* Basic Options */
+    "target": "es2019",
+    "module": "esNext",
+    "lib": ["esnext", "dom"],
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+
+    /* Strict Type-Checking Options */
+    "strict": true,
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "strictBindCallApply": true,
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitThis": true,
+    "noUncheckedIndexedAccess": true,
+
+    /* Module Resolution Options */
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "types": ["node", "mocha"],
+    "esModuleInterop": true,
+    "preserveSymlinks": true,
+    "paths": {
+      "meteor/*": ["./.meteor/local/types/packages.d.ts"]
+    }
+  },
+  "exclude": [
+    "./.meteor/local/build/**",
+    "./.meteor/local/bundler-cache/**",
+    "./packages/**",
+    "./eslint.config.mts",
+    "./eslint/**"
+  ]
+}

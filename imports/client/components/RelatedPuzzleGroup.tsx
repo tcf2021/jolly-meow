@@ -1,0 +1,219 @@
+import { faArrowDown } from "@fortawesome/free-solid-svg-icons/faArrowDown";
+import { faArrowUp } from "@fortawesome/free-solid-svg-icons/faArrowUp";
+import { faCaretDown } from "@fortawesome/free-solid-svg-icons/faCaretDown";
+import { faCaretRight } from "@fortawesome/free-solid-svg-icons/faCaretRight";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { useCallback, useEffect, useRef, useState } from "react";
+import Button from "react-bootstrap/Button";
+import { useTranslation } from "react-i18next";
+import styled from "styled-components";
+import type { TagType } from "../../lib/models/Tags";
+import type { PuzzleGroup } from "../../lib/puzzle-sort-and-group";
+import moveHuntGroup from "../../methods/moveHuntGroup";
+import { useHuntPuzzleListCollapseGroup } from "../hooks/persisted-state";
+import RelatedPuzzleList from "./RelatedPuzzleList";
+import Tag from "./Tag";
+
+export const PuzzleGroupDiv = styled.div`
+  &:not(:last-child) {
+    margin-bottom: 16px;
+  }
+`;
+
+const PuzzleGroupHeader = styled.div`
+  display: block;
+
+  &:hover {
+    cursor: pointer;
+  }
+
+  min-height: 32px;
+`;
+
+const PuzzleListWrapper = styled.div`
+  padding-left: 1.25em;
+`;
+
+const NoSharedTagLabel = styled.div`
+  display: inline-flex;
+  align-items: center;
+  line-height: 24px;
+  margin: 2px 4px 2px 0;
+  padding: 0 6px;
+  border-radius: 4px;
+  background-color: transparent;
+  color: #808080;
+`;
+
+const RelatedPuzzleGroup = ({
+  huntId,
+  group,
+  noSharedTagLabel = "(no tag)",
+  allTags,
+  bookmarked,
+  includeCount,
+  canUpdate,
+  suppressedTagIds,
+  trackPersistentExpand,
+  movableTagIds,
+}: {
+  huntId: string;
+  group: PuzzleGroup;
+  // noSharedTagLabel is used to label the group only if sharedTag is undefined.
+  noSharedTagLabel?: string;
+  bookmarked: Set<string>;
+  allTags: TagType[];
+  includeCount?: boolean;
+  canUpdate: boolean;
+  suppressedTagIds: string[];
+  trackPersistentExpand: boolean;
+  movableTagIds?: string[];
+}) => {
+  const { t } = useTranslation();
+  const [moving, setMoving] = useState(false);
+  const [moveError, setMoveError] = useState(false);
+  const [persistentCollapsed, setPersistentCollapsed] =
+    useHuntPuzzleListCollapseGroup(
+      huntId,
+      group.sharedTag?._id ?? noSharedTagLabel,
+    );
+  const [nonPersistentCollapsed, setNonPersistentCollapsed] = useState(false);
+  const lastTrackPersistentExpand = useRef(trackPersistentExpand);
+  useEffect(() => {
+    if (trackPersistentExpand !== lastTrackPersistentExpand.current) {
+      lastTrackPersistentExpand.current = trackPersistentExpand;
+      setNonPersistentCollapsed(false);
+    }
+  }, [trackPersistentExpand]);
+  const toggleCollapse = useCallback(() => {
+    if (trackPersistentExpand) {
+      setPersistentCollapsed((prevCollapsed) => !prevCollapsed);
+    } else {
+      setNonPersistentCollapsed((prevCollapsed) => !prevCollapsed);
+    }
+  }, [setPersistentCollapsed, trackPersistentExpand]);
+  const collapsed = trackPersistentExpand
+    ? persistentCollapsed
+    : nonPersistentCollapsed;
+
+  const { puzzles: relatedPuzzles, sharedTag } = group;
+  const moveIndex = sharedTag
+    ? (movableTagIds?.indexOf(sharedTag._id) ?? -1)
+    : -1;
+
+  const puzzlePlural = relatedPuzzles.length === 1 ? "puzzle" : "puzzles";
+  const countString = `(${relatedPuzzles.length} other ${puzzlePlural})`;
+  const allSuppressedTagIds = [...suppressedTagIds];
+  if (sharedTag) {
+    allSuppressedTagIds.push(sharedTag._id);
+  }
+  return (
+    <PuzzleGroupDiv>
+      <PuzzleGroupHeader
+        data-group-name={sharedTag?.name}
+        onClick={toggleCollapse}
+      >
+        <FontAwesomeIcon icon={collapsed ? faCaretRight : faCaretDown} />
+        {sharedTag ? (
+          <Tag tag={sharedTag} linkToSearch={false} popoverRelated={false} />
+        ) : (
+          <NoSharedTagLabel>{noSharedTagLabel}</NoSharedTagLabel>
+        )}
+        {includeCount && <span>{countString}</span>}
+        {canUpdate && moveIndex >= 0 && sharedTag && (
+          <span className="ms-2 d-inline-flex gap-1">
+            {(["up", "down"] as const).map((direction) => (
+              <Button
+                key={direction}
+                size="sm"
+                variant="outline-secondary"
+                className="px-2 py-0"
+                title={t(`groupOrder.${direction}`)}
+                aria-label={t(`groupOrder.${direction}`)}
+                disabled={
+                  moving ||
+                  (direction === "up"
+                    ? moveIndex === 0
+                    : moveIndex === (movableTagIds?.length ?? 0) - 1)
+                }
+                data-testid={`group-move-${direction}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setMoving(true);
+                  setMoveError(false);
+                  moveHuntGroup.call(
+                    {
+                      huntId,
+                      tagId: sharedTag._id,
+                      direction,
+                      neighborTagId:
+                        movableTagIds?.[
+                          moveIndex + (direction === "up" ? -1 : 1)
+                        ],
+                    },
+                    (error) => {
+                      setMoving(false);
+                      setMoveError(Boolean(error));
+                    },
+                  );
+                }}
+              >
+                <FontAwesomeIcon
+                  icon={direction === "up" ? faArrowUp : faArrowDown}
+                />
+              </Button>
+            ))}
+          </span>
+        )}
+        {moveError && (
+          <span className="text-danger small ms-2" role="alert">
+            {t("groupOrder.failed")}
+          </span>
+        )}
+      </PuzzleGroupHeader>
+      {collapsed ? null : (
+        <PuzzleListWrapper>
+          <RelatedPuzzleList
+            relatedPuzzles={relatedPuzzles}
+            bookmarked={bookmarked}
+            allTags={allTags}
+            canUpdate={canUpdate}
+            sharedTag={sharedTag}
+            suppressedTagIds={allSuppressedTagIds}
+          />
+          {group.subgroups.map((subgroup) => {
+            const subgroupSuppressedTagIds = [...allSuppressedTagIds];
+            if (subgroup.sharedTag) {
+              subgroupSuppressedTagIds.push(subgroup.sharedTag._id);
+            }
+            return (
+              <RelatedPuzzleGroup
+                key={subgroup.sharedTag ? subgroup.sharedTag._id : "ungrouped"}
+                huntId={huntId}
+                group={subgroup}
+                noSharedTagLabel={noSharedTagLabel}
+                bookmarked={bookmarked}
+                allTags={allTags}
+                includeCount={includeCount}
+                canUpdate={canUpdate}
+                suppressedTagIds={subgroupSuppressedTagIds}
+                trackPersistentExpand={trackPersistentExpand}
+                movableTagIds={
+                  movableTagIds
+                    ? group.subgroups.flatMap((g) =>
+                        g.sharedTag?.name.startsWith("group:")
+                          ? [g.sharedTag._id]
+                          : [],
+                      )
+                    : undefined
+                }
+              />
+            );
+          })}
+        </PuzzleListWrapper>
+      )}
+    </PuzzleGroupDiv>
+  );
+};
+
+export default RelatedPuzzleGroup;

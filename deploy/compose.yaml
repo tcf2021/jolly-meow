@@ -1,0 +1,101 @@
+name: studio-jollymeow
+services:
+  mongo:
+    image: mongo:7.0
+    command:
+      [
+        "mongod",
+        "--replSet",
+        "rs0",
+        "--bind_ip_all",
+        "--wiredTigerCacheSizeGB",
+        "0.25",
+      ]
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - database
+    mem_limit: 600m
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "--eval",
+          "try { if (rs.status().ok !== 1) quit(1); } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}); quit(1); }",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "2000"
+    volumes:
+      - mail-data:/data
+    ports:
+      - 127.0.0.1:13111:8025
+    networks:
+      outbound:
+        priority: 1000
+      database:
+        priority: 0
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  app:
+    image: studio-jollymeow:local
+    restart: unless-stopped
+    volumes:
+      - ./meteor-star.json:/app/star.json:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    environment:
+      NODE_ENV: ${JOLLYMEOW_NODE_ENV:-production}
+      ROOT_URL: http://localhost:13110
+      MONGO_URL: mongodb://mongo:27017/jollymeow?replicaSet=rs0
+      MONGO_OPLOG_URL: mongodb://mongo:27017/local?replicaSet=rs0
+      MAIL_URL: smtp://mailpit:1025
+      HTTP_FORWARDED_COUNT: "0"
+      CLUSTER_WORKERS_COUNT: "0"
+      WEBRTC_PORT: "13112"
+      WEBRTC_ANNOUNCED_ADDRESS: "127.0.0.1"
+      NODE_OPTIONS: --max-old-space-size=640
+    ports:
+      - 127.0.0.1:13110:3000
+      - 127.0.0.1:13112:13112/udp
+      - 127.0.0.1:13112:13112/tcp
+    networks:
+      outbound:
+        priority: 1000
+      database:
+        priority: 0
+    mem_limit: 900m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  database:
+    internal: true
+  outbound:
+volumes:
+  mongo-data:
+  mail-data:

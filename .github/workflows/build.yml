@@ -1,0 +1,48 @@
+name: Build Studio application
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_image:
+        description: Save the image as a downloadable artifact for local testing
+        type: boolean
+        default: false
+      save_cache:
+        description: Export build cache (disable for a faster local hotfix build)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Check incremental deployment reconstruction
+        run: python3 -m unittest discover -s deploy -p 'test_image_delta.py'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build production bundle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          tags: studio-jollymeow:ci
+          push: false
+          load: ${{ inputs.export_image }}
+          cache-from: type=gha
+          cache-to: ${{ inputs.save_cache && 'type=gha,mode=max' || '' }}
+      - name: Save image for local testing
+        if: ${{ inputs.export_image }}
+        run: docker save studio-jollymeow:ci | gzip > /tmp/studio-jollymeow-image.tar.gz
+      - name: Upload image artifact
+        if: ${{ inputs.export_image }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-jollymeow-image
+          path: /tmp/studio-jollymeow-image.tar.gz
+          retention-days: 1
+          compression-level: 0

@@ -1,0 +1,289 @@
+import { Meteor } from "meteor/meteor";
+import { useTracker } from "meteor/react-meteor-data";
+import { faCommentDots } from "@fortawesome/free-solid-svg-icons/faCommentDots";
+import { faDoorOpen } from "@fortawesome/free-solid-svg-icons/faDoorOpen";
+import { faFilePen } from "@fortawesome/free-solid-svg-icons/faFilePen";
+import { faPeopleGroup } from "@fortawesome/free-solid-svg-icons/faPeopleGroup";
+import { faPhoneVolume } from "@fortawesome/free-solid-svg-icons/faPhoneVolume";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { useEffect, useId, useState } from "react";
+import OverlayTrigger from "react-bootstrap/OverlayTrigger";
+import Tooltip from "react-bootstrap/Tooltip";
+import { useTranslation } from "react-i18next";
+import { Sparklines, SparklinesLine, SparklinesSpots } from "react-sparklines";
+import styled, { css } from "styled-components";
+import { calendarTimeFormat } from "../../lib/calendarTimeFormat";
+import {
+  ACTIVITY_GRANULARITY,
+  ACTIVITY_SEGMENTS,
+} from "../../lib/config/activityTracking";
+import relativeTimeFormat from "../../lib/relativeTimeFormat";
+import roundedTime from "../../lib/roundedTime";
+import ActivityBuckets from "../ActivityBuckets";
+import RelativeTime from "./RelativeTime";
+import { mediaBreakpointDown } from "./styling/responsive";
+
+const PuzzleActivityItems = styled.span`
+  font-size: 14px;
+  color: #666;
+  display: flex;
+  justify-content: flex-end;
+  ${mediaBreakpointDown(
+    "xs",
+    css`
+      justify-content: flex-start;
+    `,
+  )}
+`;
+
+const PuzzleActivityItem = styled.span`
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  text-align: right;
+  margin: 0 0 0 0.5rem;
+
+  span {
+    margin-right: 0.25rem;
+    margin-left: 0.125rem;
+  }
+
+  ${mediaBreakpointDown(
+    "xs",
+    css`
+      justify-content: flex-start;
+      margin-left: 0.125rem;
+    `,
+  )}
+`;
+
+const PuzzleOpenTime = styled(PuzzleActivityItem)`
+  min-width: 4.66rem;
+`;
+
+const PuzzleActivitySparkline = styled(PuzzleActivityItem)`
+  min-width: 6rem;
+  max-width: 8rem;
+
+  span {
+    margin-right: 0;
+  }
+`;
+
+const PuzzleActivityDetail = styled.div`
+  display: grid;
+  grid-template-columns: auto auto 1fr 2em;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  column-gap: 0.25rem;
+  row-gap: 0.125rem;
+`;
+
+const PuzzleActivityDetailTimeRange = styled.div`
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+`;
+
+const displayNumber = (buckets: number[]) => {
+  return buckets.at(-1) ?? 0;
+};
+
+interface PuzzleActivityProps {
+  huntId: string;
+  puzzleId: string;
+  unlockTime: Date;
+}
+
+const PuzzleActivity = ({
+  huntId,
+  puzzleId,
+  unlockTime,
+}: PuzzleActivityProps) => {
+  const [finalBucket, setFinalBucket] = useState(
+    roundedTime(ACTIVITY_GRANULARITY),
+  );
+  useEffect(
+    () => {
+      const nextBucket =
+        roundedTime(ACTIVITY_GRANULARITY).getTime() + ACTIVITY_GRANULARITY;
+      const timeout = nextBucket - Date.now();
+      const timer = Meteor.setTimeout(() => {
+        setFinalBucket(new Date(nextBucket));
+      }, timeout);
+      return () => Meteor.clearTimeout(timer);
+    },
+    // Note: The effect doesn't use finalBucket, but we want to reset the timer
+    // whenever it changes, so we include it in the dependency array.
+    [finalBucket],
+  );
+
+  const { totals, chats, calls, documents, maxTotalCount } = useTracker(() => {
+    // Build an array starting from now - ACTIVITY_GRANULARITY * ACTIVITY_BUCKETS to now
+    // with ACTIVITY_GRANULARITY intervals.
+    const counts = {
+      totals: [] as number[],
+      chats: [] as number[],
+      calls: [] as number[],
+      documents: [] as number[],
+      maxTotalCount: Math.max(
+        1,
+        ActivityBuckets.findOne(
+          {
+            hunt: huntId,
+          },
+          {
+            sort: { totalUsers: -1 },
+          },
+        )?.totalUsers ?? 0,
+      ),
+    };
+
+    for (let i = 0; i < ACTIVITY_SEGMENTS; i++) {
+      const bucket = ActivityBuckets.findOne({
+        hunt: huntId,
+        puzzle: puzzleId,
+        ts: new Date(finalBucket.getTime() - i * ACTIVITY_GRANULARITY),
+      });
+
+      counts.totals.unshift(bucket?.totalUsers ?? 0);
+      counts.chats.unshift(bucket?.chatUsers ?? 0);
+      counts.calls.unshift(bucket?.callUsers ?? 0);
+      counts.documents.unshift(bucket?.documentUsers ?? 0);
+    }
+
+    // For the displayed value in the last bucket, use the larger of the last or
+    // 2nd-to-last bucket. This prevents the number from dropping to 0
+    // immediately at the start of a new bucket, without having to wait for the
+    // next bucket to fill in.
+    counts.totals[counts.totals.length - 1] = Math.max(
+      counts.totals.at(-1) ?? 0,
+      counts.totals.at(-2) ?? 0,
+    );
+    counts.chats[counts.chats.length - 1] = Math.max(
+      counts.chats.at(-1) ?? 0,
+      counts.chats.at(-2) ?? 0,
+    );
+    counts.calls[counts.calls.length - 1] = Math.max(
+      counts.calls.at(-1) ?? 0,
+      counts.calls.at(-2) ?? 0,
+    );
+    counts.documents[counts.documents.length - 1] = Math.max(
+      counts.documents.at(-1) ?? 0,
+      counts.documents.at(-2) ?? 0,
+    );
+
+    return counts;
+  }, [finalBucket, huntId, puzzleId]);
+
+  const idPrefix = useId();
+
+  const { t, i18n } = useTranslation();
+
+  const unlockTooltip = (
+    <Tooltip id={`${idPrefix}-unlock`}>
+      {t("puzzle.activity.unlocked", "Puzzle unlocked")}:{" "}
+      {calendarTimeFormat(unlockTime, t, i18n.language)}
+    </Tooltip>
+  );
+
+  const sparklineTooltip = (
+    <Tooltip id={`${idPrefix}-sparkline`}>
+      <div>
+        {t(
+          "puzzle.activity.activeSolverCount",
+          "People working on this puzzle",
+        )}
+        :
+      </div>
+      <PuzzleActivityDetailTimeRange>
+        <div>
+          {/* Don't need to use RelativeTime here because this duration doesn't change, even as now
+            does */}
+          {relativeTimeFormat(
+            new Date(Date.now() - ACTIVITY_GRANULARITY * ACTIVITY_SEGMENTS),
+            t,
+          )}
+        </div>
+        <div>{t("datetime.now", "now")}</div>
+      </PuzzleActivityDetailTimeRange>
+      <PuzzleActivityDetail>
+        <div>
+          <FontAwesomeIcon icon={faCommentDots} />
+        </div>
+        <div>{t("puzzle.activity.chat", "Chat")}</div>
+        <div>
+          <Sparklines data={chats} min={0} max={Math.max(1, ...chats)}>
+            <SparklinesLine color="white" />
+            <SparklinesSpots
+              spotColors={{ "-1": "white", 0: "white", 1: "white" }}
+            />
+          </Sparklines>
+        </div>
+        <div>{displayNumber(chats)}</div>
+        <div>
+          <FontAwesomeIcon icon={faPhoneVolume} />
+        </div>
+        <div>{t("puzzle.activity.call", "Call")}</div>
+        <div>
+          <Sparklines data={calls} min={0} max={Math.max(1, ...calls)}>
+            <SparklinesLine color="white" />
+            <SparklinesSpots
+              spotColors={{ "-1": "white", 0: "white", 1: "white" }}
+            />
+          </Sparklines>
+        </div>
+        <div>{displayNumber(calls)}</div>
+        <div>
+          <FontAwesomeIcon icon={faFilePen} />
+        </div>
+        <div>{t("puzzle.activity.doc", "Doc")}</div>
+        <div>
+          <Sparklines data={documents} min={0} max={Math.max(1, ...documents)}>
+            <SparklinesLine color="white" />
+            <SparklinesSpots
+              spotColors={{ "-1": "white", 0: "white", 1: "white" }}
+            />
+          </Sparklines>
+        </div>
+        <div>{displayNumber(documents)}</div>
+      </PuzzleActivityDetail>
+    </Tooltip>
+  );
+
+  return (
+    <PuzzleActivityItems>
+      <OverlayTrigger placement="top" overlay={unlockTooltip}>
+        <PuzzleOpenTime>
+          <FontAwesomeIcon icon={faDoorOpen} />
+          <RelativeTime
+            date={unlockTime}
+            terse
+            minimumUnit="hour"
+            maxElements={2}
+          />
+        </PuzzleOpenTime>
+      </OverlayTrigger>
+      <OverlayTrigger placement="top" overlay={sparklineTooltip}>
+        <PuzzleActivitySparkline>
+          <FontAwesomeIcon icon={faPeopleGroup} />
+          {/* Sparklines doesn't accept a className argument, so we can't use styled-components */}
+          <Sparklines
+            data={totals}
+            min={0}
+            max={maxTotalCount}
+            style={{ width: "100%" }}
+          >
+            <SparklinesLine />
+            <SparklinesSpots
+              spotColors={{ "-1": "black", 0: "black", 1: "black" }}
+            />
+          </Sparklines>
+          <span>{displayNumber(totals)}</span>
+        </PuzzleActivitySparkline>
+      </OverlayTrigger>
+    </PuzzleActivityItems>
+  );
+};
+
+export default PuzzleActivity;

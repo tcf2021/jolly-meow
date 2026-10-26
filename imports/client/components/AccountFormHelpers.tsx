@@ -1,0 +1,248 @@
+import { Google } from "meteor/google-oauth";
+import { OAuth } from "meteor/oauth";
+import { useTracker } from "meteor/react-meteor-data";
+import { ServiceConfiguration } from "meteor/service-configuration";
+import type React from "react";
+import type {
+  ChangeEvent,
+  ComponentPropsWithRef,
+  FC,
+  SubmitEvent,
+} from "react";
+import { useCallback, useEffect, useId, useState } from "react";
+import Alert from "react-bootstrap/Alert";
+import Button from "react-bootstrap/Button";
+import Form from "react-bootstrap/Form";
+import { useTranslation } from "react-i18next";
+import { styled } from "styled-components";
+import Flags from "../../Flags";
+
+export type GoogleSignInCredentials = {
+  token: string;
+  secret: string;
+};
+
+export enum AccountFormSubmitState {
+  IDLE = "idle",
+  SUBMITTING = "submitting",
+  FAILED = "failed",
+  SUCCESS = "success",
+}
+
+const StyledFormPage = styled.div`
+  float: none;
+  margin: auto;
+  overflow: auto;
+  margin-top: 20px;
+  margin-bottom: 20px;
+  border-radius: 10px;
+  padding: 15px;
+`;
+
+const StyledTitle = styled.h3`
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 18px;
+  font-weight: 800;
+  text-align: center;
+`;
+
+export const useEmailField = ({
+  initialValue,
+  disabled,
+  explanation,
+}: {
+  initialValue?: string | (() => string);
+  disabled: boolean;
+  explanation?: string;
+}) => {
+  const [email, setEmail] = useState<string>(initialValue ?? "");
+  const onEmailChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setEmail(e.target.value);
+  }, []);
+  const { t } = useTranslation();
+  const controlId = useId();
+  return {
+    email,
+    emailField: (
+      <Form.Group className="mb-3" controlId={controlId}>
+        <Form.Label>{t("common.email", "Email")}</Form.Label>
+        <Form.Control
+          type="email"
+          value={email}
+          placeholder={t("common.email", "Email")}
+          autoCapitalize="none"
+          autoCorrect="off"
+          onChange={onEmailChange}
+          disabled={disabled}
+        />
+        {explanation ? <Form.Text>{explanation}</Form.Text> : undefined}
+      </Form.Group>
+    ),
+  };
+};
+
+export const usePasswordField = ({ disabled }: { disabled: boolean }) => {
+  const [password, setPassword] = useState<string>("");
+  const onPasswordChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setPassword(e.target.value);
+  }, []);
+  const { t } = useTranslation();
+  const controlId = useId();
+  return {
+    password,
+    passwordField: (
+      <Form.Group className="mb-3" controlId={controlId}>
+        <Form.Label>{t("auth.password", "Password")}</Form.Label>
+        <Form.Control
+          type="password"
+          value={password}
+          placeholder={t("auth.password", "Password")}
+          autoCapitalize="none"
+          autoCorrect="off"
+          onChange={onPasswordChange}
+          disabled={disabled}
+        />
+      </Form.Group>
+    ),
+  };
+};
+
+const GoogleSignInButton: FC<ComponentPropsWithRef<typeof Button>> = styled(
+  Button,
+)`
+  background-image: url("/google-signin.svg");
+  width: 175px;
+  height: 40px;
+`;
+
+export const useGoogleSignInCredentialsField = ({
+  disabled,
+  onCredentialsSet,
+}: {
+  disabled: boolean;
+  onCredentialsSet?: (credentials: { token: string; secret: string }) => void;
+}) => {
+  const config = useTracker(
+    () => ServiceConfiguration.configurations.findOne({ service: "google" }),
+    [],
+  );
+  const googleDisabled = useTracker(() => Flags.active("disable.google"), []);
+  const [googleSignInCredentials, setGoogleSignInCredentials] = useState<
+    GoogleSignInCredentials | undefined
+  >(undefined);
+  const [submitState, setSubmitState] = useState<AccountFormSubmitState>(
+    AccountFormSubmitState.IDLE,
+  );
+  const submitting = submitState === AccountFormSubmitState.SUBMITTING;
+
+  useEffect(() => {
+    if (!disabled && !submitting) setGoogleSignInCredentials(undefined);
+  }, [disabled, submitting]);
+
+  const requestComplete = useCallback(
+    (token: string) => {
+      const secret = OAuth._retrieveCredentialSecret(token);
+      if (!secret) {
+        setSubmitState(AccountFormSubmitState.IDLE);
+        return;
+      }
+      setSubmitState(AccountFormSubmitState.IDLE);
+      setGoogleSignInCredentials({
+        token,
+        secret,
+      });
+      onCredentialsSet?.({ token, secret });
+    },
+    [onCredentialsSet],
+  );
+
+  const onClick = useCallback(() => {
+    setSubmitState(AccountFormSubmitState.SUBMITTING);
+    Google.requestCredential(requestComplete);
+  }, [requestComplete]);
+
+  const googleSignInCredentialsField =
+    !googleDisabled && googleSignInCredentials === undefined ? (
+      <GoogleSignInButton
+        variant="outline-secondary"
+        onClick={onClick}
+        disabled={disabled || submitting}
+      />
+    ) : undefined;
+
+  return {
+    googleAvailable: config !== undefined && !googleDisabled,
+    googleSignInCredentials,
+    googleSignInCredentialsField,
+    googleSignInSubmitState: submitState,
+  };
+};
+
+export const useDisplayNameField = ({ disabled }: { disabled: boolean }) => {
+  const { t } = useTranslation();
+  const [displayName, setDisplayName] = useState<string>("");
+  const onDisplayNameChange = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      setDisplayName(e.target.value);
+    },
+    [],
+  );
+  const controlId = useId();
+  return {
+    displayName,
+    displayNameField: (
+      <Form.Group className="mb-3" controlId={controlId}>
+        <Form.Label>{t("registration.displayName")}</Form.Label>
+        <Form.Control
+          type="text"
+          placeholder={t("registration.displayName")}
+          autoCapitalize="none"
+          autoCorrect="off"
+          value={displayName}
+          onChange={onDisplayNameChange}
+          disabled={disabled}
+        />
+        <Form.Text>{t("registration.displayNameHelp")}</Form.Text>
+      </Form.Group>
+    ),
+  };
+};
+
+export const AccountFormFrame = ({
+  children,
+  title,
+  state,
+  successMessage,
+  errorMessage,
+  infoMessage,
+  onSubmitForm,
+}: {
+  children: React.ReactNode;
+  title: string;
+  state: AccountFormSubmitState;
+  successMessage?: string;
+  errorMessage?: string;
+  infoMessage?: string;
+  onSubmitForm: (e: SubmitEvent<HTMLFormElement>) => void;
+}) => {
+  return (
+    <StyledFormPage>
+      <StyledTitle>{title}</StyledTitle>
+      <div>
+        <form noValidate action="#" method="POST" onSubmit={onSubmitForm}>
+          <fieldset>
+            {state === AccountFormSubmitState.FAILED ? (
+              <Alert variant="danger">{errorMessage}</Alert>
+            ) : null}
+            {infoMessage ? <Alert variant="info">{infoMessage}</Alert> : null}
+            {state === AccountFormSubmitState.SUCCESS ? (
+              <Alert variant="success">{successMessage}</Alert>
+            ) : null}
+            {children}
+          </fieldset>
+        </form>
+      </div>
+    </StyledFormPage>
+  );
+};

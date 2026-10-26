@@ -1,0 +1,43 @@
+# Overlay the local stack with a source-watching Meteor development server.
+# Existing database, mail, accounts, OAuth URLs and port 13110 are retained.
+services:
+  app:
+    image: studio-jollymeow:dependencies
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: dependencies
+    working_dir: /src
+    command:
+      - sh
+      - -c
+      - node deploy/prepare-excalidraw-assets.mjs && exec meteor run --allow-superuser --port 0.0.0.0:3000 --no-release-check --exclude-archs web.browser.legacy,web.cordova
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: --max-old-space-size=3072
+      TOOL_NODE_FLAGS: --no-opt --max-old-space-size=4096
+      METEOR_WATCH_FORCE_POLLING: "true"
+      METEOR_WATCH_POLLING_INTERVAL_MS: "1000"
+    volumes: !override
+      - dev-meteor-tools-upstream:/root/.meteor
+      - ..:/src
+      - dev-node-modules-upstream:/src/node_modules
+      - dev-meteor-cache-upstream:/src/.meteor/local
+      - dev-excalidraw-assets:/src/public/excalidraw
+    mem_limit: 6g
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      retries: 12
+
+volumes:
+  dev-meteor-tools-upstream:
+  dev-node-modules-upstream:
+  dev-meteor-cache-upstream:
+  dev-excalidraw-assets:

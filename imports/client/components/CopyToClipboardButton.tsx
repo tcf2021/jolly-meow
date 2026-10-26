@@ -1,0 +1,62 @@
+import { useCallback, useId, useRef, useState } from "react";
+import Button, { type ButtonProps } from "react-bootstrap/Button";
+import OverlayTrigger, {
+  type OverlayTriggerProps,
+} from "react-bootstrap/OverlayTrigger";
+import Tooltip from "react-bootstrap/Tooltip";
+import { useTranslation } from "react-i18next";
+
+interface CopyToClipboardProps extends ButtonProps {
+  tooltipPlacement?: OverlayTriggerProps["placement"];
+  text: string | (() => string); // the text to copy, or a function that will generate it lazily
+}
+
+const CopyToClipboardButton = (props: CopyToClipboardProps) => {
+  const { tooltipPlacement, text, children, ...rest } = props;
+  const [copied, setCopied] = useState<boolean>(false);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const { t } = useTranslation();
+  const onClick = useCallback(() => {
+    const flatText: string = typeof text === "function" ? text() : text;
+    void navigator.clipboard.writeText(flatText).then(
+      () => {
+        if (timeoutRef.current !== undefined) {
+          clearTimeout(timeoutRef.current);
+        }
+        setCopied(true);
+        timeoutRef.current = setTimeout(() => {
+          timeoutRef.current = undefined;
+          setCopied(false);
+        }, 3000);
+      },
+      (error) => {
+        // oxlint-disable-next-line no-console
+        console.error("could not copy to clipboard:", error.message);
+      },
+    );
+  }, [text]);
+  const tooltipId = useId();
+
+  const copyTooltip = (
+    <Tooltip id={tooltipId}>
+      {copied
+        ? t("common.copied", "Copied!")
+        : t("common.copyToClipboard", "Copy to clipboard")}
+    </Tooltip>
+  );
+
+  return (
+    <OverlayTrigger
+      placement={tooltipPlacement ?? "top-start"}
+      overlay={copyTooltip}
+    >
+      <Button {...rest} onClick={onClick}>
+        {children}
+      </Button>
+    </OverlayTrigger>
+  );
+};
+
+export default CopyToClipboardButton;

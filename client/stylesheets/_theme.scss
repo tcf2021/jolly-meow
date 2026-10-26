@@ -1,0 +1,29 @@
+$font-family-sans-serif:
+  "Platform Emoji", "Source Sans Pro", "Helvetica Neue", "Helvetica", "Arial",
+  sans-serif, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji";
+$font-family-monospace:
+  "Platform Emoji", "Source Code Pro", "Consolas", "Monaco", monospace,
+  "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji";
+$font-family-base: $font-family-sans-serif;
+$font-size-base: 0.875rem;
+$body-color: #262626;
+$primary: #1677ff;
+$headings-font-weight: 600;
+$h1-font-size: 1.625rem;
+$h2-font-size: 1.125rem;
+$h3-font-size: 1rem;
+$h4-font-size: 1rem;
+$border-radius: 0.375rem;
+
+$link-decoration: none;
+$link-hover-decoration: underline;
+
+$toast-max-width: 380px;
+
+@import "../../node_modules/bootstrap/scss/functions";
+@import "../../node_modules/bootstrap/scss/variables";
+@import "../../node_modules/bootstrap/scss/mixins";
+
+:root {
+  --bs-toast-max-width: #{$toast-max-width};
+}

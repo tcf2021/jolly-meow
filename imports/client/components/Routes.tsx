@@ -1,0 +1,159 @@
+import React, { Suspense, useEffect } from "react";
+import type { RouteObject } from "react-router-dom";
+import { Navigate, useRoutes } from "react-router-dom";
+import { ThemeProvider } from "styled-components";
+import { useMediaQuery } from "usehooks-ts";
+import { BreadcrumbsProvider } from "../hooks/breadcrumb";
+import { useAppThemeState } from "../hooks/persisted-state";
+import useDocumentTitle from "../hooks/useDocumentTitle";
+import { darkTheme, lightTheme } from "../theme";
+import AllProfileListPage from "./AllProfileListPage";
+import AnnouncementsPage from "./AnnouncementsPage";
+import { AuthenticatedPage, UnauthenticatedPage } from "./authentication";
+import DingwordManagerPage from "./DingwordManagerPage";
+import EnrollForm from "./EnrollForm";
+import FirehosePage from "./FirehosePage";
+import FirstUserForm from "./FirstUserForm";
+import ForgotPasswordForm from "./ForgotPasswordForm";
+import GuessQueuePage from "./GuessQueuePage";
+import HintQueuePage from "./HintQueuePage";
+import HuntApp from "./HuntApp";
+import HuntersApp from "./HuntersApp";
+import HuntListApp from "./HuntListApp";
+import HuntListPage from "./HuntListPage";
+import HuntProfileListPage from "./HuntProfileListPage";
+import HuntTagManagerPage from "./HuntTagManagerPage";
+import InfoPage from "./InfoPage";
+import JoinHunt from "./JoinHunt";
+import Loading from "./Loading";
+import LoginForm from "./LoginForm";
+import PasswordResetForm from "./PasswordResetForm";
+import ProfilePage from "./ProfilePage";
+import PuzzleListPage from "./PuzzleListPage";
+import PuzzlePage from "./PuzzlePage";
+import PuzzleUrlRedirector from "./PuzzleUrlRedirector";
+import RegisterForm from "./RegisterForm";
+import RootRedirector from "./RootRedirector";
+import UserInvitePage from "./UserInvitePage";
+import UsersApp from "./UsersApp";
+import VerifyEmailPage from "./VerifyEmailPage";
+
+const HuntEditPage = React.lazy(() => import("./HuntEditPage"));
+const SetupPage = React.lazy(() => import("./SetupPage"));
+const RTCDebugPage = React.lazy(() => import("./RTCDebugPage"));
+
+/* Authenticated routes - if user not logged in, get redirected to /login */
+export const AuthenticatedRouteList: RouteObject[] = [
+  {
+    path: "/hunts",
+    element: <HuntListApp />,
+    children: [
+      {
+        path: ":huntId",
+        element: <HuntApp />,
+        children: [
+          { path: "announcements", element: <AnnouncementsPage /> },
+          { path: "firehose", element: <FirehosePage /> },
+          { path: "info", element: <Navigate to="/info" replace /> },
+          { path: "guesses", element: <GuessQueuePage /> },
+          { path: "hints", element: <HintQueuePage /> },
+          {
+            path: "hunters",
+            element: <HuntersApp />,
+            children: [
+              { path: "", element: <HuntProfileListPage /> },
+              { path: "invite", element: <UserInvitePage /> },
+              { path: ":userId", element: <ProfilePage /> },
+            ],
+          },
+          { path: "puzzles/:puzzleId", element: <PuzzlePage /> },
+          {
+            path: "puzzleByUrl/:puzzleUrl/:puzzleTitle",
+            element: <PuzzleUrlRedirector />,
+          },
+          { path: "puzzles", element: <PuzzleListPage /> },
+          { path: "tags", element: <HuntTagManagerPage /> },
+          { path: "edit", element: <HuntEditPage /> },
+          { path: "", element: <Navigate to="puzzles" replace /> },
+        ],
+      },
+      { path: "new", element: <HuntEditPage /> },
+      { path: "", element: <HuntListPage /> },
+    ],
+  },
+  {
+    path: "/users",
+    element: <UsersApp />,
+    children: [
+      { path: ":userId", element: <ProfilePage /> },
+      { path: "", element: <AllProfileListPage /> },
+    ],
+  },
+  { path: "/dingwords", element: <DingwordManagerPage /> },
+  { path: "/info", element: <InfoPage /> },
+  { path: "/setup", element: <SetupPage /> },
+  { path: "/rtcdebug", element: <RTCDebugPage /> },
+].map((r) => {
+  return Object.assign(r, {
+    element: <AuthenticatedPage>{r.element}</AuthenticatedPage>,
+  });
+});
+
+/* Unauthenticated routes - if user already logged in, get redirected to /hunts */
+export const UnauthenticatedRouteList: RouteObject[] = [
+  { path: "/login", element: <LoginForm /> },
+  { path: "/register", element: <RegisterForm /> },
+  { path: "/forgot-password", element: <ForgotPasswordForm /> },
+  { path: "/reset-password/:token", element: <PasswordResetForm /> },
+  { path: "/enroll/:token", element: <EnrollForm /> },
+  { path: "/create-first-user", element: <FirstUserForm /> },
+].map((r) => {
+  return Object.assign(r, {
+    element: <UnauthenticatedPage>{r.element}</UnauthenticatedPage>,
+  });
+});
+
+export const RouteList: RouteObject[] = [
+  /* Index redirect */
+  {
+    path: "/",
+    element: <RootRedirector />,
+  },
+  ...AuthenticatedRouteList,
+  ...UnauthenticatedRouteList,
+  // JoinHunt handles both authenticated and unauthenticated users.
+  // Authenticated users are presented with a single button to join the hunt.
+  // Unauthenticated users are presented with a login or account provisioning
+  // flow that depends on the invitation code.
+  { path: "/join/:invitationCode", element: <JoinHunt /> },
+  { path: "/verify-email/:token", element: <VerifyEmailPage /> },
+];
+
+const Routes = React.memo(() => {
+  useDocumentTitle("Jolly Meow");
+
+  const routes = useRoutes(RouteList);
+  const [appTheme] = useAppThemeState();
+  const systemPrefersDark = useMediaQuery("(prefers-color-scheme: dark)");
+  const effectiveTheme =
+    appTheme === "auto" ? (systemPrefersDark ? "dark" : "light") : appTheme;
+  const theme = effectiveTheme === "dark" ? darkTheme : lightTheme;
+
+  useEffect(() => {
+    const body = document.body;
+    body.dataset.bsTheme = effectiveTheme ?? "light";
+    return () => {
+      delete body.dataset.bsTheme;
+    };
+  }, [effectiveTheme]);
+
+  return (
+    <ThemeProvider theme={theme}>
+      <BreadcrumbsProvider>
+        <Suspense fallback={<Loading />}>{routes}</Suspense>
+      </BreadcrumbsProvider>
+    </ThemeProvider>
+  );
+});
+
+export default Routes;

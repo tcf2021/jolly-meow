@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+jsconfig.json
+.vscode/launch.json
+
+# Local deployment metadata and credentials
+deploy/meteor-star.json
+.env
+.env.local
+.env.*.local
+/.local-secrets/
+/public/excalidraw/
+.swc
+__pycache__/

@@ -1,0 +1,10 @@
+Dockerfile
+.meteor/local
+node_modules
+cloudformation
+.github/workflows
+.git
+deploy/*.tar
+deploy/*.tar.gz
+.local-secrets
+public/excalidraw
