@@ -40,7 +40,7 @@ jobs:
         run: docker save studio-jollymeow:ci | gzip > /tmp/studio-jollymeow-image.tar.gz
       - name: Upload image artifact
         if: ${{ inputs.export_image }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: studio-jollymeow-image
           path: /tmp/studio-jollymeow-image.tar.gz
